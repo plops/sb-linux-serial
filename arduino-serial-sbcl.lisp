@@ -19,17 +19,17 @@
   `(unsigned-byte 31))
 
 #+nil
-(defparameter *com* (multiple-value-list (open-serial "/dev/ttyUSB0" :rate B9600)))
+(defparameter *com* (open-serial "/dev/ttyUSB0" :rate B9600))
 
 #+nil
-(sb-sys:fd-stream-fd (first *com*))
+(sb-sys:fd-stream-fd *com*)
 
 #+nil
 (close-serial *com*)
 
 (defun open-serial (tty &key (element-type 'character) (rate B115200))
   (declare (type (or pathname string) tty)
-	   (values stream fd-type &optional))
+	   (values stream &optional))
   (let* ((fd (sb-posix:open
 	      tty (logior O-RDWR
 			  O-NOCTTY #+nil (this terminal can't control this program)
@@ -75,33 +75,28 @@
     (tcflush fd TCIFLUSH) #+nil (throw away any input data)
 
     (tcsetattr fd TCSANOW term) #+nil (set terminal port attributes)
-    (values
-     (sb-sys:make-fd-stream fd :input t :output t :element-type element-type
-			    :buffering :full)
-     fd)))
+    (sb-sys:make-fd-stream fd :input t :output t :element-type element-type
+			   :buffering :full)))
 
-(defun close-serial (fd)
-  (declare (fd-type fd)
+(defun close-serial (s)
+  (declare (type stream s)
 	   (values null &optional))
-  (fcntl fd F-SETFL 0) #+nil (reset file status flags, clearing e.g. O-NONBLOCK)
-  (sb-posix:close fd) #+nil (this will set DTR low)
+  (let ((fd (sb-sys:fd-stream-fd s)))
+   (fcntl fd F-SETFL 0) #+nil (reset file status flags, clearing e.g. O-NONBLOCK)
+   (sb-posix:close fd) #+nil (this will set DTR low))
   nil)
 
-(defun serial-recv-length (fd)
-  (declare (fd-type fd)
+(defun serial-recv-length (s)
+  (declare (type stream s)
 	   (values (signed-byte 32) &optional))
   (sb-alien:with-alien ((bytes sb-alien:int))
-    (ioctl fd FIONREAD (sb-alien:addr bytes))
+    (ioctl (sb-sys:fd-stream-fd s) FIONREAD (sb-alien:addr bytes))
     bytes))
 
-(defun read-response (tty-fd tty-stream)
-  (declare (fd-type tty-fd)
-	   (stream tty-stream)
+(defun read-response (tty-stream)
+  (declare (type stream tty-stream)
 	   (values string &optional))
-  (declare (fd-type tty-fd)
-	   (stream tty-stream)
-	   (values string &optional))
-  (let ((n (serial-recv-length tty-fd)))
+  (let ((n (serial-recv-length tty-stream)))
     (if (eq 0 n)
 	""
 	(let ((ret (make-string n)))
@@ -114,47 +109,41 @@
 ;; more information on resetting arduino:
 ;; http://playground.arduino.cc/Main/DisablingAutoResetOnSerialConnection
 
-(defun set-dtr (fd val)
-  (declare (fd-type fd)
-           (boolean val)
+(defun set-dtr (s val)
+  (declare (type stream s)
+           (type boolean val)
            (values (signed-byte 32) &optional))
   (let ((TIOCM-DTR 2)
         (TIOCMSET #x5418))
     (sb-alien:with-alien ((serial sb-alien:int))
       (setf (ldb (byte 1 TIOCM-DTR) serial) (if val 1 0))
-      (arduino-serial-sbcl::ioctl fd TIOCMSET (sb-alien:addr serial))
+      (arduino-serial-sbcl::ioctl (sb-sys:fd-stream-fd s)
+				  TIOCMSET (sb-alien:addr serial))
       serial)))
 
 
 (defun write-arduino (tty-stream command)
-  (declare (stream tty-stream)
-	   (string command))
+  (declare (type stream tty-stream)
+	   (type string command))
   (format tty-stream "~a~a" command #\Return)
   (finish-output tty-stream))
 
-(defun write-arduino-image (tty-stream data)
+(defun ensure-response-buffer-clear (s)
+ (unless (= 0 (serial-recv-length s))
+   (read-response s)))
+
+(defun talk-arduino (tty-stream command &key (time .009d0))
   (declare (type stream tty-stream)
-	   (type (array (unsigned-byte 8) *) data))
-  (write-sequence data tty-stream)
-  (finish-output tty-stream))
-
-(defun ensure-response-buffer-clear (fd str)
- (unless (= 0 (serial-recv-length fd))
-   (read-response fd str)))
-
-(defun talk-arduino (tty-fd tty-stream command &key (time .009d0))
-  (declare (fd-type tty-fd)
-	   (stream tty-stream)
-	   (string command)
+	   (type string command)
 	   (values string &optional))
-  (ensure-response-buffer-clear tty-fd tty-stream)
+  (ensure-response-buffer-clear tty-stream)
   (write-arduino tty-stream command)
   ;(sleep .1)
   (let ((n (do ((i 0 (1+ i))
-		(n 0 (serial-recv-length tty-fd)))
+		(n 0 (serial-recv-length tty-stream)))
 	       ((or (< 0 n) (<= 30 i)) n)
 	     (sleep time))))
     (if (eq 0 n)
 	""
-	(read-response tty-fd tty-stream))))
+	(read-response tty-stream))))
 
